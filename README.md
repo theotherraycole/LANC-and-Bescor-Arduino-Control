@@ -1,6 +1,8 @@
 # LANC-and-Bescor-Arduino-Control
 Control a Bescor MP101 pan/tilt head and a LANC camera via an Arduino UNO using a Wii nunchuk
 
+NOTE: Detailed wiring instructions will be put here eventually...I'm really not sure how many will be interested in this project. I've seen code for LANC control, but it is not interrupt-driven and is therefore suspectible to anything that disturbs the timing of the main loop. This code uses an interrupt-driven method of handling LANC. The main loop is pretty much dedicated to reading the nunchuk for commands. This was created to help the Leander Church of Christ to control a single camera during service for the purpose of broadcasting and recording our service.
+
 You will need the nunchuk library from http://www.gabrielbianconi.c
 Connect the nunchuk according to the library's instructions.
 
