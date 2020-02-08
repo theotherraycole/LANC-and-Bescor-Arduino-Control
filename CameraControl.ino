@@ -17,6 +17,7 @@
 // ----------------------------------------------------------------------------------------------
 // Define the I/O pins
 // Bescor MP-101
+// If you change pins, modify setup for tilt/pan to set the appropriate timer
 // ----------------------------------------------------------------------------------------------
 #define leftPin  10                                       // pan left
 #define rightPin  9                                       // pan right
@@ -24,30 +25,31 @@
 #define downPin   3                                       // tilt down
 
 // LANC signal
+// Leave this on pin 2. We will use timer0 without modifying timer0 overflow frequency so delay, millis, micros, etc. all work as normal
 #define lancPin   2                                       // lanc (camera control) - needs to be on pin 2 for interrupts
 
 // ----------------------------------------------------------------------------------------------
 // Define nunchuk controller ranges and such
 // ----------------------------------------------------------------------------------------------
-#define MIN_CENTER    15                                  // minimum movement to come off center
-#define CENTER_POINT 128                                  // proper center reading point
-#define X_CENTER     (CENTER_POINT - 123)                 // based on nunchuk showing (123,136) at startup
-#define Y_CENTER     (CENTER_POINT - 136)                 // based on nunchuk showing (123,136) at startup
-#define Z_CENTER     (CENTER_POINT - 0)                   // z-axis (not calibrarted)
-#define RANGE        100                                  // full range
-#define RANGE_UP      89                                  // up range is limited on my nunchuk
-#define RANGE_DOWN   100                                  // down range is good
-#define RANGE_LEFT   100                                  // left range is good
-#define RANGE_RIGHT   99                                  // right is almost there
+#define MIN_CENTER                                     15 // minimum movement to come off center
+#define CENTER_POINT                                  130 // proper center reading point
+#define RANGE                                         100 // full range
+#define RANGE_UP                                       90 // up range is limited on my nunchuk. Assume all directions go at 90% range
+#define RANGE_DOWN                                     90 // down range is good
+#define RANGE_LEFT                                     90 // left range is good
+#define RANGE_RIGHT                                    90 // right is almost there
 
-#define MODE_TIME        500                              // mode change time
-#define POWEROFF_TIME   5000                              // power off time (how long to hold both buttons to power off)
-#define INACTIVE_TIMEOUT 120                              // inactive timeout in minutes
+#define MODE_TIME                                     500 // mode change time
+#define POWEROFF_TIME                                5000 // power off time (how long to hold both buttons to power off)
+#define INACTIVE_TIMEOUT                              120 // inactive timeout in minutes
 
-#define ZOOM_STEP       20                                // zoom speed stepping (how far controller has to be moved for each change in zoom speed)
-#define ZOOM_SPEEDS      8                                // zoom speeds (there are 8 slow and 8 fast 
+#define ZOOM_STEP                                      20 // zoom speed stepping (how far controller has to be moved for each change in zoom speed)
+#define ZOOM_SPEEDS                                     8 // zoom speeds (there are 8 slow and 8 fast) 
 
-ArduinoNunchuk nunchuk;                                   // The instance of the Nunchuck class
+static int aNeutralX = CENTER_POINT;                      // assume perfect center for now
+static int aNeutralY = CENTER_POINT;                      // assume perfect center for now
+static ArduinoNunchuk nunchuk;                            // The instance of the Nunchuck class
+
 // ----------------------------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------------------------
@@ -56,23 +58,26 @@ ArduinoNunchuk nunchuk;                                   // The instance of the
 // Telegram timings may need adjustment for non-NTSC version of the camera
 // Other camera modesl may also need telegram adjustment and additional statuses to be added.
 // ----------------------------------------------------------------------------------------------
-#define LANC_BIT_TICKS                                 26 // need this to be 104us between bits (16MHz / 64 * 26 = 104us)
-                                                          // assumes scaling factor of 64 - default for timer 0 on Arduino Uno
+#define LANC_BIT_USEC                                 104 // bit width for LANC is 140us
+#define LANC_BIT_TICKS  LANC_BIT_USEC / (1000000 / (F_CPU / 64)) // need this to be 104us between bits (16MHz / 64 * 26 = 104us), so 26 for Uno
+                                                                 // assumes scaling factor of 64 - default for timer 0 on Arduino Uno
 
-#define LANC_MID_TICKS            (LANC_BIT_TICKS / 3)    // # ticks to place into a good spot for reading bits. 33% gives some timing wiggle room
+#define LANC_MID_TICKS               (LANC_BIT_TICKS / 2) // # ticks to place into a good spot for reading bits (halfway)
 
-#define TELEGRAM_SIG_MIN_USEC                    6000     // minimum usecs for telegram signal length
-#define TELEGRAM_SIG_MAX_USEC                   20000     // maximum usecs for telegram signal length
+#define TELEGRAM_SIG_MIN_USEC                        6000 // minimum usecs for telegram signal length
+#define TELEGRAM_SIG_MAX_USEC                       20000 // maximum usecs for telegram signal length
+
+#define LANC_NO_COMM_TIMEOUT                      1000000 // no communication if this many usec have passed without a telegram
  
-#define LANC_STATE_RESET                            0     // reset (searching for initial telegram)
-#define LANC_STATE_TELEGRAM                         1     // searching for telegram
-#define LANC_STATE_STOPBIT                          2     // waiting for a stopbit
-#define LANC_STATE_BYTE                             3     // processing byte data
-#define LANC_STATE_END_BYTE                         4     // at end of byte
+#define LANC_STATE_RESET                                0 // reset (searching for initial telegram)
+#define LANC_STATE_TELEGRAM                             1 // searching for telegram
+#define LANC_STATE_STOPBIT                              2 // waiting for a stopbit
+#define LANC_STATE_BYTE                                 3 // processing byte data
+#define LANC_STATE_END_BYTE                             4 // at end of byte
 
-#define LANC_STATUS_STOP                          0x02    // stopped
-#define LANC_STATUS_RECORDING                     0x04    // recording
-#define LANC_STATUS_PAUSED                        0x14    // paused
+#define LANC_STATUS_STOP                             0x02 // camera is stopped (not ready to record - observed during powerup)
+#define LANC_STATUS_RECORDING                        0x04 // camera is recording
+#define LANC_STATUS_PAUSED                           0x14 // camera is paused
 
 static void lancFalling();                                // LANC falling interrupt
 
@@ -81,23 +86,28 @@ class CameraLANC                                          // LANC camera impleme
 
 private:
 
-  volatile char itsPowered;                               // is it powered on?
+           unsigned long itsWaitSt;                       // wait for low start time
+  
+           byte itsPin;                                   // I/O pin. Some sketches use 2 pins, this one uses one 
+           byte itsPinMask;                               // pin mask
+  volatile uint8_t *itsReadPort;                          // read port - only use in interrupts
+  volatile uint8_t *itsWritePort;                         // write port - only use in interrupts
+  volatile uint8_t *itsModePort;                          // mode port - only use in interrupts
+           
   volatile byte itsStatus;                                // overall status
-
-  volatile int  itsState;                                 // protocol state
-  volatile int  itsBitCnt;                                // bit number being processed
-  volatile int  itsSendCnt;                               // send counter
-  volatile int  itsCurVal;                                // current value being sent
-  
-  volatile byte itsValue[2];                              // values to write
-  volatile byte itsRead[8];                               // bytes for LANC
-
-  volatile unsigned long itsWaitSt;                       // wait for low start time
-    
-  volatile bool itsSendRdy;                               // is send ready?
+  volatile byte itsStatus2;                               // secondary status
+           byte itsLastStat;                              // last status displayed
+           byte itsState;                                 // protocol state
+           byte itsBitCnt;                                // bit number being processed
+           byte itsSendCnt;                               // send counter
+ 
+           byte itsCurVal;                                // current value being sent 
+           byte itsValue[4];                              // values to write
+           byte itsRead[8];                               // bytes for LANC
+   
+  volatile bool itsSendRdy;                               // is data ready to send?
   volatile bool itsDone;                                  // sending of data has completed
-  
-  int           itsPin;                                   // I/O pin. Some sketches use 2 pins, this one uses one
+  volatile bool itsPowered;                               // is it powered on?
 
 public :
   
@@ -107,22 +117,30 @@ public :
     itsPin = lancPin;                                     // set I/O pin
     pinMode(itsPin, INPUT_PULLUP);                        // set input pin for input
     itsStatus = 0;                                        // no status
+    itsStatus2 = 0;                                       // no status
+    itsLastStat = 0;                                      // last displayed status
     itsDone = true;                                       // finished transferring
     itsBitCnt = 0;                                        // bit counter
     itsSendRdy = false;                                   // not ready to send yet
     itsSendCnt = 0;                                       // no send counter yet
     itsWaitSt = 0;                                        // no time yet
     itsState = LANC_STATE_RESET;                          // in reset state for now
+    itsPinMask = digitalPinToBitMask(itsPin);             // get pin mask
+    itsReadPort = portInputRegister(digitalPinToPort(itsPin));   // get read port
+    itsWritePort = portOutputRegister(digitalPinToPort(itsPin)); // get write port
+    itsModePort = portModeRegister(digitalPinToPort(itsPin));    // get mode port
+    itsValue[2] = itsValue[3] = 0;                        // clear second command bytes - not used
   }
 
   void Setup()                                            // Setup
-
-  {                                                       // begin setup
-    itsWaitSt = micros();                                 // get waiting time
-    TIMSK0 |= _BV(OCIE0A);                                // turn on interrupt handler      
+  {                                                       // begin setup    
+    itsWaitSt = micros();                                 // get waiting time     
     attachInterrupt(digitalPinToInterrupt(itsPin),        // start
                     lancFalling,                          // monitor the pin
                     FALLING);                             // for falls
+    //Serial.println(TCCR0A, HEX);
+    TCCR0A = 0;
+    TIMSK0 |= _BV(OCIE0A);                                // turn on interrupt handler
   }                                                       // end setup
   
   void PowerOn()                                          // turn camera on
@@ -132,21 +150,22 @@ public :
       delay(200);                                         // wait for a moment for camera to see this
       pinMode(itsPin, INPUT_PULLUP);                      // back to input
   }
-    
+
   void Record()                                           // start recording
   {
-      if (itsStatus != 0x04)                              // if not already recording    
-         SendCode(0x18, 0x33);                            // toggle recording to record
+      if (itsStatus == LANC_STATUS_PAUSED)                // if not already recording    
+         ToggleRecord();
   }
   
   void Pause()                                            // pause recording
   {
-      if (itsStatus == 0x04)                              // if recording
-         SendCode(0x18, 0x33);                            // toggle recording to pause
+      if (itsStatus == LANC_STATUS_RECORDING)             // if recording
+         ToggleRecord();                                  // toggle to pause
   }
   
   void PowerOff() { SendCode(0x18, 0x5e); };              // send command to power off (sleep)
   void ToggleDisplay() { SendCode(0x18, 0xb4); };         // toggle display
+  void ToggleRecord() { SendCode(0x18, 0x33); };          // toggle record
   void Menu() { SendCode(0x18, 0x9A); };                  // go to top menu
   void Select() { SendCode(0x18, 0xA2); };                // select item on screen
   void Left() { SendCode(0x18, 0xC4); };                  // move left
@@ -157,14 +176,14 @@ public :
   void FocusNear() { SendCode(0x28, 0x47); };             // focus near
   void FocusFar() { SendCode(0x28, 0x45); };              // focus far
   bool IsPowered() { return itsPowered; };                // is it powered up?
-  byte Status() { return itsStatus;  };                   // return status
 
   void SendCode(int type,int code)                        // send a code pair
   {
-
     while (itsPowered &&                                  // we have power and
            (itsSendRdy || !itsDone) &&                    // if we have another command pending
-           (itsValue[0] != type && itsValue[1] != code)) delay(2); // and it isn't the same one, then wait <-- Would be nice to have a queue, but this rarely happens
+           (itsValue[0] != type ||                        // command is not
+            itsValue[1] != code))                         // identical
+              delay(2);                                   // wait for a while
 
     if (!itsSendRdy && itsDone)                           // able to send it?
     {                                                     // begin mark to send
@@ -188,23 +207,53 @@ public :
     
   }
 
-  byte GetStatus()                                        // obtain the status
+  byte Status()                                           // obtain the status
   {                                                       // begin obtain status
-     byte aStatus;                                        // status return
+     byte aStatus;                                        // primary status
      ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
      {
-        aStatus = itsStatus;                              // grab the status safely
+        aStatus = itsStatus;                              // grab the primary status
      }
      return(aStatus);                                     // return the status
   };                                                      // end obtain status
 
+  byte Status2()                                          // obtain secondary status
+  {                                                       // begin obtain secondary status
+     byte aStatus2;                                       // secondary status
+     ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+     {
+        aStatus2 = itsStatus2;                            // grab the secondary status
+     }
+     return(aStatus2);                                    // return the status
+  };                                                      // end obtain secondary status
+
   void Display()                                          // display status information
   {
-      static byte aLastStat = 0;
-      if (aLastStat == itsStatus) return;
-      aLastStat = GetStatus();
-      if (IsPowered()) Serial.print("Camera is on, "); else Serial.print("Camera is off, ");
-      Serial.print("Status "); Serial.print(Status(), HEX); Serial.println();
+      int aStatus = Status();                             // grab status
+      if (itsLastStat == aStatus) return;                 // finished if same as last time
+      itsLastStat = aStatus;                              // save status
+      if (IsPowered())                                    // powered on?
+        Serial.print("Camera is on, ");                   // say powered on
+     else                                                 // otherwise
+        Serial.print("Camera is off, ");                  // powered off
+      Serial.print("Status ");                            // give status
+      switch(aStatus)                                     // translate to text
+      {
+         case 0 :
+          Serial.println("N/A");                          // 0 is what we set when powered off
+          break;
+         case LANC_STATUS_STOP :                          // stopped
+          Serial.println("Stopped");
+         break; 
+         case LANC_STATUS_PAUSED :                        // paused
+          Serial.println("Paused");
+         break;
+        case LANC_STATUS_RECORDING :                      // recording
+         Serial.println("Recording");
+         break;
+        default :
+          Serial.println(aStatus, HEX);                   // give number of none of the above
+      }                                                   // end translate to text
   }
  
   inline void Falling()                                   // signal from high to low
@@ -222,9 +271,7 @@ public :
           Serial.println("Camera powered up");
           return;                                         // wait for it to signal some more
       };                                                  // end mark powered on  
-
-      unsigned long aWaited = aCurTime - itsWaitSt;       // compute time between falls
-               
+            
       switch(itsState)                                    // check state
       {                                                   // begin cases of state
 
@@ -233,20 +280,33 @@ public :
 
         case LANC_STATE_TELEGRAM                        : // ready for new telegram
         case LANC_STATE_RESET                           : // ready for reset
+        {        
+          unsigned long aWaited = aCurTime - itsWaitSt;   // compute time between falls
           if (aWaited > TELEGRAM_SIG_MIN_USEC &&          // was the duration of the telegram signal
               aWaited < TELEGRAM_SIG_MAX_USEC)            // something that looks reasonable?
           {                                               // begin telegram found
              if (itsState == LANC_STATE_RESET)            // was it a reset
                 itsSendCnt = 0;                           // reset send counter
-             itsBitCnt = 0;                               // starting with first bit
-             itsWaitSt = aCurTime;                        // set wait start time
-
-             if (itsSendCnt > 3 && itsSendRdy)            // are values waiting to be written and are we ready?
+             else                                         // otherwise
+             if (!itsDone && itsSendCnt < 4)              // if we have a command to send and haven't completed it
+             {                                            // begin mark as sent
+                if (itsSendCnt == 3)                      // if we have sent three times
+                {                                         // begin send empty command
+                  itsValue[0] = 0;                        // clear command
+                  itsValue[1] = 0;                        // clear subcommand
+                }                                         // end send empty command
+                itsSendCnt ++;                            // bump send count up
+                if (itsSendCnt == 4)                      // if sent
+                   itsDone = true;                        // mark as complete
+             };                                           // end mark as sent   
+             if (itsDone && itsSendRdy)                   // are we ready for a new command and is a new command waiting?
              {                                            // begin pickup values to write
                 itsDone = false;                          // we are not done
                 itsSendRdy = false;                       // no more value pending
                 itsSendCnt = 0;                           // we haven't sent it yet
              }                                            // end pickup values to write
+             itsBitCnt = 0;                               // starting with first bit
+             itsWaitSt = aCurTime;                        // set wait start time
              aSetTimer = true;                            // set the timer (telegram detection really detects the first stop bit after a telegram)
           }                                               // end telegram found
           else                                            // otherwise
@@ -256,7 +316,8 @@ public :
              itsState = LANC_STATE_RESET;                 // reset - did not find the telegram
              itsWaitSt = aCurTime;                        // set wait start time
           };                                              // end reset
-          break;                                          // end telegram processing
+        }   
+        break;                                            // end telegram processing
 
         case LANC_STATE_STOPBIT                         : // stopbit
           aSetTimer = true;                               // we will set the timer
@@ -264,22 +325,16 @@ public :
 
       if (aSetTimer)                                      // need to set timer?
       {                                                   // begin set timer
-          itsWaitSt = aCurTime;                           // reset wait start time
-          
-          if (itsBitCnt == 16 && itsSendCnt >= 2)         // wrote the command twice?
-             itsDone = true;                              // we are done - ready for another command
 
           itsState = LANC_STATE_BYTE;                     // processing bytes now
       
           int aNewCmp = aCurCnt + LANC_BIT_TICKS;         // prepare new compare register value
       
-          if (itsBitCnt >= 16 && itsBitCnt < 64)          // in read range?
+          if (itsBitCnt >= 32 && itsBitCnt < 64)          // in read range?
             aNewCmp += LANC_MID_TICKS;                    // want to land in the middle of the bits we read
-                     
-          unsigned aSave = TCCR0A;                        // save timer setup
-          TCCR0A = 0;                                     // turn timer off for just a brief moment
+
           OCR0A = aNewCmp;                                // set new register
-          TCCR0A = aSave;                                 // enable timer  
+
       };                                                  // end set timer
 
   }
@@ -295,39 +350,38 @@ public :
       
         aRc = LANC_BIT_TICKS;                             // assume we will want to process again in 1 bit's width of time
 
-        if (itsBitCnt >= 16)                              // in area where we should read bytes?
+        if (itsBitCnt >= 32)                              // in area where we should read bytes?
         {                                                 // begin read bytes    
             int aByte = itsBitCnt / 8;                    // get byte number        
             int aBit = itsBitCnt % 8;                     // get remainder to identify bit
             if (aBit == 0)                                // if low        
                 itsRead[aByte] = 0;                       // clear status byte
-            if (digitalRead(itsPin) == LOW)               // == *LOW* because bits inverted in LANC         
+            if ((*itsReadPort & itsPinMask)== LOW)        // == *LOW* because bits inverted in LANC         
                 itsRead[aByte] |= 1 << aBit;              // record bit high
         }                                                 // end read bytes
         else                                              // otherwise
         {                                                 // begin write data
-            if (itsBitCnt == 0 || itsBitCnt == 8)         // new byte boundary?
+            if (itsBitCnt % 8 == 0)                       // start of byte?
             {                                             // begin pickup byte to write
-                pinMode(itsPin,OUTPUT);                   // set for output 
-                itsCurVal = itsValue[itsBitCnt / 8];      // grab value to write
-            };                                            // end pickup byte to write
-            if (!itsDone)                                 // actual data to write?
-            {                                             // begin write bit
-                digitalWrite(itsPin, !(itsCurVal & 1));   // write reversed
-                itsCurVal >>= 1;                          // advance to next bit
-            }                                             // end write bit
-            else                                          // otherwise
-                digitalWrite(itsPin, !0);                 // write zeroes
+                *itsModePort |= itsPinMask;               // set for output
+                if (!itsDone)                             // in process of sending command?
+                   itsCurVal = itsValue[itsBitCnt / 8];   // grab value to write
+                else                                      // otherwise
+                   itsCurVal = 0;                         // send zeroes
+            };                                            // end pickup byte to write                      
+            if (!(itsCurVal & 1))                         // do we need to write high bit (must reverse bit)
+              *itsWritePort |= itsPinMask;                // set pin high
+            else                                          // otherwise               
+              *itsWritePort &= ~itsPinMask;               // set pin low
+            itsCurVal >>= 1;                              // advance to next bit
         };                                                // end write data
 
-        itsBitCnt ++;                                     // bump bit counter
+        itsBitCnt ++;                                     // bump bit counter   
 
-        if (itsBitCnt == 64 && itsSendCnt < 4)            // at the end and send counter not too high?
-           itsSendCnt ++;                                 // nope, bump counter     
-
-        if (itsBitCnt >= 64)                              // finished with read bits?
+        if (itsBitCnt == 64)                              // finished with read bits?
         {                                                 // begin setup status
-            itsStatus = itsRead[4];                       // set overall status
+            itsStatus = itsRead[4];                       // grab overall status
+            itsStatus2 = itsRead[5];                      // grab secondary status 
             if (itsStatus != LANC_STATUS_STOP &&          // if status  
                 itsStatus != LANC_STATUS_RECORDING &&     // is not something we would
                 itsStatus != LANC_STATUS_PAUSED)          // expect (add to this if your camera shows another valid status...or disabled this check as it is just a safety net...)
@@ -337,29 +391,33 @@ public :
                 Serial.print("Bad status ");              // indicate status looks wrong
                 Serial.println(itsStatus, HEX);           // write out the status we obtained
                 aRc = 0;                                  // just need to return
-            };                                            // end reset
+            }                                             // end reset
         }                                                 // end setup status
                                                           
         if (aRc != 0 &&                                   // normal return so far
             (itsBitCnt % 8) == 0)                         // end of a byte?
         {                                                 // begin end of byte
             itsState = LANC_STATE_END_BYTE;               // wait on end of byte
-            if (itsBitCnt > 16)                           // if in reading range
+            if (itsBitCnt > 32)                           // if in reading range
               aRc -= LANC_MID_TICKS;                      // reduce the ticks because we are reading halfway into the time for each bit      
         };                                                // end of byte        
         break;                                            // end processing bytes
 
       case LANC_STATE_END_BYTE                          : // end of byte
-        pinMode(itsPin, INPUT_PULLUP);                    // toggle back to read mode
+        *itsModePort &= ~itsPinMask;                      // set for input
+        *itsWritePort |= itsPinMask;                      // with pullup
         if (itsBitCnt == 64)                              // last bit processed?
+        {                                                 // begin wait for telegram
+           itsWaitSt = micros();                          // set start of wait
            itsState = LANC_STATE_TELEGRAM;                // new telegram should be next
+        }                                                 // end wait for telegram
         else                                              // otherwise
            itsState = LANC_STATE_STOPBIT;                 // wait for stopbit
-        itsWaitSt = micros();                             // start of wait
         break;                                            // end byte
 
       default                                           : // default
-        if (itsPowered && micros() - itsWaitSt > 1000000) // powered on but long time since a pulse has been observed?
+        if (itsPowered && micros() - itsWaitSt >          // we have power but
+              LANC_NO_COMM_TIMEOUT)                       // telegrams can't be processed
         {                                                 // begin powered off
           itsStatus = 0;                                  // status not read
           itsPowered = false;                             // power has failed (or at least communication has)
@@ -384,22 +442,19 @@ void lancFalling()
 // LANC Timer Interrupt routine for reading/writing bits
 // This calls will adjust the compare register to setup for the next bit to process
 // ----------------------------------------------------------------------------------------------
-ISR(TIMER0_COMPA_vect)                                    // setup for compare register A on timer 0
-{                                                         // begin LANC interrupt
+ISR(TIMER0_COMPA_vect)                                   // setup for compare register A on timer 0
+{                                                        // begin LANC interrupt
 
-    unsigned anEntry = OCR0A;                             // grab last compare
+    unsigned anEntry = OCR0A;                            // grab last compare
     
-    int aNext = Camera.ProcessBits();                     // call routine to process bits
+    int aNext = Camera.ProcessBits();                    // call routine to process bits
     
-    if (aNext != 0)                                       // need to adjust?
-    {                                                     // begin set next compare 
-        aNext = aNext + anEntry;                          // set next relative to compare register on entry
-        unsigned aSave = TCCR0A;                          // save timer setup
-        TCCR0A = 0;                                       // turn timer off for just a brief moment
-        OCR0A = aNext;                                    // set new register
-        TCCR0A = aSave;                                   // resume timer
-    }                                                     // end set next compare
-}                                                         // end LANC interrupt
+    if (aNext != 0)                                      // need to adjust?
+    {                                                    // begin set next compare 
+        aNext = aNext + anEntry;                         // set relative to compare register on entry
+        OCR0A = aNext;                                   // set new register
+    }                                                    // end set next compare
+}                                                        // end LANC interrupt
 
 // -------------------------------------------------------------------------------------------------------
 
@@ -566,7 +621,6 @@ class ZoomCtrl
 
      {                                                      // begin mark up
 
-
         if (itsNeutral != 0)                                // if set
         {
            //Serial.println("Zoom stopped.");
@@ -631,8 +685,6 @@ public:
 
   {
 
-    //if (abs(theVelocity) < MIN_CENTER) theVelocity = 0;   // allow some play for centering of control
-
     theVelocity = constrain(theVelocity, -RANGE, RANGE);  // constraint within our design limts
 
     if (theVelocity == itsVelocity) return false;         // no change? Nothing to do here - move on
@@ -643,12 +695,9 @@ public:
     else if (theVelocity < itsVelocity) itsVelocity = max(itsVelocity - 2, -RANGE);
     else itsVelocity = 0;
 
-    if (Zoom.itsLastZoom != 0)                            // if zooming
-      itsVelocity = theVelocity;                          // don't worry about smooth
-
     int aDrive = -1;                                      // assume off
     
-    if (itsVelocity > 0)                                  // negative velocity
+    if (itsVelocity > 0)                                  // positive velocity
       aDrive = itsPin[1];                                 // drive second pin
     else                                                  // otherwise
       if (itsVelocity < 0) aDrive = itsPin[0];            // drive first pin if negative
@@ -658,16 +707,16 @@ public:
          //Serial.print(itsDrive); Serial.println(" : Off");
          digitalWrite(itsDrive, LOW);                     // drop old pin low         
     }
+
+// To Do: If moving opposite direction from previous movemement, bump PWM to max for a moment to take out gear slop.
+// Will need to save last non-zero drive that made it beyond MIN_CENTER threshold
       
     itsDrive = aDrive;                                    // set new drive pin
       
     if (itsDrive == -1) return false;                     // not being driven? get out of here!
 
     if (abs(itsVelocity) > MIN_CENTER)                    // allow some play for centering of control
-       analogWrite(itsDrive, map(abs(itsVelocity), MIN_CENTER, 100, (float) 255 * itsLow / 100, (float) 255 * itsHigh / 100));
-    else
-    if (abs(theVelocity) > MIN_CENTER)
-       analogWrite(itsDrive, 0);                        
+       analogWrite(itsDrive, map(abs(itsVelocity), MIN_CENTER, 100, (float) 255 * itsLow / 100, (float) 255 * itsHigh / 100));                      
     else
     {
        analogWrite(itsDrive, 0);                          // stop
@@ -691,9 +740,16 @@ class PanMotor : public PwmMotor
 {
   public :
      PanMotor() : PwmMotor(leftPin, rightPin, 1, 30) {};
+     void Setup()
+     {
+        PwmMotor::Setup();
+        // Setup PWM for pan PWM pins
+        TCCR1A = _BV(COM1A1) | _BV(WGM10);
+        TCCR1B =  _BV(CS12) | _BV(CS10); // 0x05
+     }
      bool Input()
      {
-       int aVelocity = nunchuk.analogX - CENTER_POINT + X_CENTER;
+       int aVelocity = nunchuk.analogX - aNeutralX;
        if (aVelocity < 0) aVelocity = map(abs(aVelocity), 1, RANGE_LEFT, 1, 100) * -1;
        else aVelocity = map(abs(aVelocity), 1, RANGE_RIGHT, 1, 100);
        return(Move(aVelocity));      
@@ -704,9 +760,15 @@ class TiltMotor : public PwmMotor
 {
   public :
      TiltMotor() : PwmMotor(downPin, upPin, 1, 30) {};
+     void Setup()
+     {
+        PwmMotor::Setup();
+        TCCR2A = _BV(COM2A1) | _BV(WGM20);
+        TCCR2B =  _BV(CS22)  | _BV(CS21) | _BV(CS20);
+     }
      bool Input()
      {
-       int aVelocity = nunchuk.analogY - CENTER_POINT + Y_CENTER;
+       int aVelocity = nunchuk.analogY - aNeutralY;
        if (aVelocity < 0) aVelocity = map(abs(aVelocity), 1, RANGE_DOWN, 1, 100) * -1;
        else aVelocity = map(abs(aVelocity), 1, RANGE_UP, 1, 100);
        return(Move(aVelocity));
@@ -771,6 +833,9 @@ class SerialControl                                       // serial input contro
         break;
        case 'I' :                                         // toggle display
         Camera.ToggleDisplay();
+        break;
+       case 'T' :
+        Camera.ToggleRecord();
         break;
        case 'l' :
         Camera.Left();
@@ -840,7 +905,10 @@ Serial.println("Initializing nunchuck");
 
 nunchuk.init();                                             // Initialize the Nunchuck code
 
-nunchuk.update();
+nunchuk.update();                                           // Get first values
+
+aNeutralX = nunchuk.analogX;                                // get neutral X
+aNeutralY = nunchuk.analogY;                                // get neutral Y
 
 Serial.print("Nunchuk (");                                  // Assuming nobody is touching it, 
 Serial.print(nunchuk.analogX);                              // lets us see what it reads at neutral
@@ -850,16 +918,7 @@ Serial.println(")");
 
 Pan.Setup();                                                // setup pan
 Tilt.Setup();                                               // setup tilt
-
-// Setup PWM for pan/tilt pins
-TCCR1A = _BV(COM1A1) | _BV(WGM10);
-TCCR1B =  _BV(CS12) | _BV(CS10); // 0x05
-
-TCCR2A = _BV(COM2A1) | _BV(WGM20);
-TCCR2B =  _BV(CS22)  | _BV(CS21) | _BV(CS20);
-
-Camera.Setup();
-
+Camera.Setup();                                             // setup camera
 
 Serial.println("We are ready");
 
@@ -871,50 +930,34 @@ Serial.println("We are ready");
 void loop()
 {
   
-static unsigned long aLastAct = millis();                               // last activity time
-static unsigned long aLastCheck = millis();                             // last camera check
-static int aMode = 0;                                                   // mode 0 - normal (1 - menu control)
+static unsigned long aLastAct = millis();                     // last activity time
+//static unsigned long aLastCheck = 0;                          // last camera check
+static int aMode = 0;                                         // mode 0 - normal (1 - menu control)
 
-bool  anAction = false;                                                 // no action yet
-bool  cDown = cButton.Down();                                           // get pre-update state
-bool  zDown = zButton.Down();                                           // get pre-update state
+unsigned long aCurTime = millis();                            // current time
 
-nunchuk.update();                                                      // update nunchuk data
+bool  anAction = false;                                       // no action yet
+bool  cDown = cButton.Down();                                 // get pre-update state
+bool  zDown = zButton.Down();                                 // get pre-update state
 
-//Serial.print("Nunchuk (");                                  // Assuming nobody is touching it, 
-//Serial.print(nunchuk.analogX);                              // lets us see what it reads at neutral
-//Serial.print(",");
-//Serial.print(nunchuk.analogY);
-//Serial.println(")");
-//nunchuk.analogX = 130; nunchuk.analogY = 130;
+nunchuk.update();                                             // update nunchuk data
 
-unsigned long aCurTime = millis();                                      // current time
+anAction |= zButton.Input();                                  // get z button state
+anAction |= cButton.Input();                                  // get c button state
 
-anAction |= zButton.Input();                                            // get z button state
-anAction |= cButton.Input();                                            // get c button state
+if (cDown & !cButton.Down() && zButton.Down())                // changed state while other button is down as well
+   zButton.itsDownTime = aCurTime;                            // reset z button down time (keep from bobbling releasing from both down)
 
-if (cDown & !cButton.Down() && zButton.Down())                          // changed state while other button is down as well
-   zButton.itsDownTime = aCurTime;                                      // reset z button down time (keep from bobbling releasing from both down)
+if (zDown & !zButton.Down() && cButton.Down())                // changed state while other button is down as well
+   cButton.itsDownTime = aCurTime;                            // reset c button down time (keep from bobbling releasing from both down)
 
-if (zDown & !zButton.Down() && cButton.Down())                          // changed state while other button is down as well
-   cButton.itsDownTime = aCurTime;                                      // reset c button down time (keep from bobbling releasing from both down)
+anAction |= SerialCtrl.Input();                               // get serial input
 
-anAction |= SerialCtrl.Input();                                         // get serial input
-
-static unsigned long aLoopCnt = 0;
-aLoopCnt ++;
-if (aCurTime - aLastCheck > 5000)                                       // get status
-{
-  //Serial.println(aLoopCnt);
-  aLoopCnt = 0;
-  aLastCheck = aCurTime;
+//if (aCurTime - aLastCheck > 4085)                             // get status
+//{
+//  aLastCheck += 4085;
   Camera.Display();
-  
-//  Serial.print("accelX: "); Serial.println(nunchuk.accelX);
-//  Serial.print("accelY: "); Serial.println(nunchuk.accelY);
-//  Serial.print("accelZ: "); Serial.println(nunchuk.accelZ);
-  
-};
+//};
 
 //
 // Holding both buttons down more than 5 seconds toggles power.
@@ -927,7 +970,7 @@ if (zButton.Down() && cButton.Down())                                   // both 
   Tilt.Stop();                                                          // stop - user doing something special
   Pan.Stop();                                                           // stop - user doing something special
   
-  if (aCurTime - zButton.itsDownTime  > POWEROFF_TIME &&                 // both buttons down long enough?
+  if (aCurTime - zButton.itsDownTime  > POWEROFF_TIME &&                // both buttons down long enough?
       aCurTime - cButton.itsDownTime  > POWEROFF_TIME)
   {
     
@@ -972,28 +1015,18 @@ if (zButton.Down() && cButton.Down())                                   // both 
 
   if (aCurTime - zButton.itsDownTime > MODE_TIME &&                     // both buttons down long enough?
       aCurTime - cButton.itsDownTime > MODE_TIME &&
-      abs(nunchuk.analogY - CENTER_POINT + Y_CENTER) > 80)              // if stick up or down?
+      abs(nunchuk.analogY - aNeutralY) > 80)                            // if stick up or down?
 
   {                                                                     // begin change modes
-
-    if (nunchuk.analogY - CENTER_POINT + Y_CENTER > 0)                  // up?
-
+    if (nunchuk.analogY - aNeutralY > 0)                                // up?
     {                                                                   // begin change mode
-
-        aMode = (aMode + 1) % 2;                                        // only 2 modes, switch
-      
-        Camera.ToggleDisplay();                                         // toggle display
-
-        Serial.print("Mode is now "); Serial.println(aMode);
-      
+        aMode = (aMode + 1) % 2;                                        // only 2 modes, switch     
+        Camera.ToggleDisplay();                                         // toggle display   
+        Serial.print("Mode is now "); Serial.println(aMode);      
     }                                                                   // end change mode
- 
     else                                                                // if down
-
     {                                                                   // begin toggle display
-
         Camera.ToggleDisplay();                                         // toggle display
-    
     };                                                                  // end toggle display
 
     cButton.itsDownTime = aCurTime;                                     // reset timer
@@ -1006,7 +1039,6 @@ if (zButton.Down() && cButton.Down())                                   // both 
 else
 
 if (aMode == 0)                                                         // normal mode
-
 {                                                                       // begin normal mode
 
   if (Camera.IsPowered())                                               // if camera is on (dangerous to tilt/pan with it off - someone might be physically handling camera)
@@ -1017,103 +1049,71 @@ if (aMode == 0)                                                         // norma
   }
 
 }                                                                       // end normal mode
-
 else
-
 if (aMode == 1)                                                         // menu mode
-
 {                                                                       // begin menu mode
 
    static unsigned long aLastCmd = millis();                            // get last command time
 
    if (aCurTime - aLastCmd > 250)                                       // if last command long enough ago
-
    {                                                                    // begin take action
-
-      int aX = nunchuk.analogX - CENTER_POINT + X_CENTER;               // get X
-      int aY = nunchuk.analogY - CENTER_POINT + Y_CENTER;               // get Y
+      int aX = nunchuk.analogX - aNeutralX;                             // get X
+      int aY = nunchuk.analogY - aNeutralY;                             // get Y
 
       if (abs(aX) > 80)                                                 // intentionally moved
-
       {                                                                 // begin move left/right
-
           if (aX > 0)                                                   // moving right
              Camera.Right();                                            // move right
           else                                                          // otherwise
              Camera.Left();                                             // move left
-
-          aLastCmd = aCurTime;                                          // had action
-      
+          aLastCmd = aCurTime;                                          // had action    
       }                                                                 // end move left/right
-
-      else                                                              // otherwise
-      
+      else                                                              // otherwise     
       if (abs(aY) > 80)                                                 // intentionally moved
-
       {                                                                 // begin move up/down
-
           if (aY > 0)                                                   // moving up?
              Camera.Up();                                               // move up
           else                                                          // otherwise
              Camera.Down();                                             // move down
-
           aLastCmd = aCurTime;                                          // had action
-      
       }                                                                 // end move up/down
-
       else                                                              // otherwise
-
       if (zButton.Down() && cButton.Down())                             // both buttons down?
-
       {                                                                 // begin ignore
-         
+        
       }                                                                 // end ignore
-
       else                                                              // otherwise
-
       if (zButton.Down() && aCurTime - zButton.itsDownTime > 100)       // c button is definitely down
-
       {
-
           Camera.Select();                                              // being select
-
           aLastCmd = aCurTime;                                          // mark action
-
       }
       else 
-
       if (cButton.Down() && aCurTime - cButton.itsDownTime > 100)       // c button is definitely down
-
       {
-
           Camera.Menu();                                                // being menu
-
           aLastCmd = aCurTime;                                          // mark action
-
       }; 
 
    };                                                                   // end take action
 
 };                                                                      // end menu mode
 
-if (!Camera.IsPowered())                                                 // camera not powered?
+if (!Camera.IsPowered())                                                // camera not powered 
 {                                                                       // begin stop tilt/pan
-  Tilt.Stop();
-  Pan.Stop();                                                           
+  Tilt.Stop();                                                          // all stop
+  Pan.Stop();                                                           // all stop
 }                                                                       // end stop tilt/pan
 
 if (anAction)                                                           // had action?
    aLastAct = aCurTime;                                                 // store last action timestamp
 
 if (Camera.IsPowered() && (((aCurTime - aLastAct) / 1000 / 60) >= INACTIVE_TIMEOUT)) // inactive?
-
 {                                                                       // begin power off
 
   Serial.println("Turning off camera.");
-
   Camera.PowerOff();                                                    // power off
-  delay(5000);                                                          // wait for poweroff to work
-    
+  delay(5000);                                                          // wait for poweroff to work   
 };                                                                      // end power off
 
 }
